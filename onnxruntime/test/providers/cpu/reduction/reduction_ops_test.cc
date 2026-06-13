@@ -6991,5 +6991,55 @@ TEST(ReductionOpTest, ReduceProd_EmptySet_DefaultAxes_KeepDims) {
             kTensorrtExecutionProvider, kWebGpuExecutionProvider});
 }
 
+// Regression test for https://github.com/microsoft/onnxruntime/issues/28450
+// Verify that ReduceSum of a large uniform float tensor accumulates accurately
+// by using double-precision intermediates. Before the fix, summing 1.4M elements
+// of 0.1f produced an error of ~243; with double accumulation, the error is < 1.
+TEST(ReductionOpTest, ReduceSum_float_large_uniform_precision) {
+  // Reproduce the scenario from issue #28450: ones(5,68,64,64) * 0.1
+  constexpr int64_t N = 5 * 68 * 64 * 64;  // 1,392,640 elements
+  constexpr float kValue = 0.1f;
+
+  // Compute expected result using double accumulation (ground truth).
+  double expected_double = static_cast<double>(N) * static_cast<double>(kValue);
+  float expected = static_cast<float>(expected_double);
+
+  std::vector<float> data(N, kValue);
+
+  OpTester test("ReduceSum", 13);
+  test.AddAttribute("keepdims", (int64_t)0);
+  test.AddInput<float>("data", {5, 68, 64, 64}, data);
+  test.AddInput<int64_t>("axes", {4}, {0, 1, 2, 3}, true);
+  test.AddOutput<float>("reduced", {}, {expected});
+  test.SetOutputAbsErr("reduced", 1.0f);
+  // Only test CPU EP since this fix is CPU-specific.
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "",
+           {kCoreMLExecutionProvider, kCudaExecutionProvider, kDmlExecutionProvider,
+            kDnnlExecutionProvider, kMIGraphXExecutionProvider, kOpenVINOExecutionProvider,
+            kQnnExecutionProvider, kTensorrtExecutionProvider, kWebGpuExecutionProvider});
+}
+
+// Same test for ReduceMean, which also benefits from double accumulation.
+TEST(ReductionOpTest, ReduceMean_float_large_uniform_precision) {
+  constexpr int64_t N = 5 * 68 * 64 * 64;
+  constexpr float kValue = 0.1f;
+
+  // Mean of a uniform array is the value itself.
+  float expected = kValue;
+
+  std::vector<float> data(N, kValue);
+
+  OpTester test("ReduceMean");
+  test.AddAttribute("axes", std::vector<int64_t>{0, 1, 2, 3});
+  test.AddAttribute("keepdims", (int64_t)0);
+  test.AddInput<float>("data", {5, 68, 64, 64}, data);
+  test.AddOutput<float>("reduced", {}, {expected});
+  test.SetOutputAbsErr("reduced", 1e-6f);
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "",
+           {kCoreMLExecutionProvider, kCudaExecutionProvider, kDmlExecutionProvider,
+            kDnnlExecutionProvider, kMIGraphXExecutionProvider, kOpenVINOExecutionProvider,
+            kQnnExecutionProvider, kTensorrtExecutionProvider, kWebGpuExecutionProvider});
+}
+
 }  // namespace test
 }  // namespace onnxruntime
