@@ -161,6 +161,13 @@ inline bool reduce_isnan<int64_t>(int64_t) { return false; }
 template <typename T>
 inline constexpr bool kReduceUseKahan = std::is_same_v<T, int64_t> || std::is_same_v<T, uint64_t>;
 
+// Types that benefit from accumulating in double for better precision.
+// Includes all integer types (to avoid overflow) and float (to avoid precision loss
+// in large reductions — see https://github.com/microsoft/onnxruntime/issues/28450).
+// Excludes double itself since there is no wider type to promote to.
+template <typename T>
+inline constexpr bool kReduceUseDoubleAccumulator = std::is_integral_v<T> || std::is_same_v<T, float>;
+
 class ReduceAggregatorBase {
  public:
   // Fast reduction: see OptimizeShapeForFastReduce's comment.
@@ -235,7 +242,7 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
  public:
   inline ReduceAggregatorSum(int64_t N, const T&) : ReduceAggregator<T, T>(N, 0) {}
   inline void update(const T& v) {
-    if constexpr (std::is_integral_v<T>) {
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
       if constexpr (kReduceUseKahan<T>) {
         double y = static_cast<double>(v) - kahan_compensation_;
         double t = double_accumulator_ + y;
@@ -249,7 +256,7 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
     }
   }
   static T aggall(const T* from_data, int64_t size) {
-    if constexpr (std::is_integral_v<T>) {
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
       double sum = 0.0;
       if constexpr (kReduceUseKahan<T>) {
         double comp = 0.0;
@@ -264,10 +271,12 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
           sum += static_cast<double>(from_data[i]);
         }
       }
-      constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-      constexpr double t_min = static_cast<double>(std::numeric_limits<T>::min());
-      if (sum >= t_max) return std::numeric_limits<T>::max();
-      if (sum <= t_min) return std::numeric_limits<T>::min();
+      if constexpr (std::is_integral_v<T>) {
+        constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+        constexpr double t_min = static_cast<double>(std::numeric_limits<T>::min());
+        if (sum >= t_max) return std::numeric_limits<T>::max();
+        if (sum <= t_min) return std::numeric_limits<T>::min();
+      }
       return static_cast<T>(sum);
     } else {
       return Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>>(
@@ -279,11 +288,13 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
     return aggall(from_data, this->N_);
   }
   inline T get_value() {
-    if constexpr (std::is_integral_v<T>) {
-      constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-      constexpr double t_min = static_cast<double>(std::numeric_limits<T>::min());
-      if (double_accumulator_ >= t_max) return std::numeric_limits<T>::max();
-      if (double_accumulator_ <= t_min) return std::numeric_limits<T>::min();
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
+      if constexpr (std::is_integral_v<T>) {
+        constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+        constexpr double t_min = static_cast<double>(std::numeric_limits<T>::min());
+        if (double_accumulator_ >= t_max) return std::numeric_limits<T>::max();
+        if (double_accumulator_ <= t_min) return std::numeric_limits<T>::min();
+      }
       return static_cast<T>(double_accumulator_);
     } else {
       return this->accumulator_;
@@ -322,8 +333,8 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
     T* out = output.MutableData<T>();
     int64_t n_rows = fast_shape[0];
 
-    if constexpr (std::is_integral_v<T>) {
-      // Accumulate rows in double to avoid signed overflow UB, then saturate.
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
+      // Accumulate rows in double for better precision (integers: avoid overflow; float: avoid precision loss).
       concurrency::ThreadPool::TryParallelFor(
           tp, onnxruntime::narrow<std::ptrdiff_t>(N), ParallelReduceFastCost(1, n_rows, sizeof(T), 6),
           [data, out, N, n_rows](ptrdiff_t begin, ptrdiff_t end) {
@@ -332,12 +343,16 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
               for (int64_t row = 0; row < n_rows; ++row) {
                 sum += static_cast<double>(data[row * N + col]);
               }
-              constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-              constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
-              if (sum >= t_max) {
-                out[col] = std::numeric_limits<T>::max();
-              } else if (sum <= t_min) {
-                out[col] = std::numeric_limits<T>::lowest();
+              if constexpr (std::is_integral_v<T>) {
+                constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+                constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
+                if (sum >= t_max) {
+                  out[col] = std::numeric_limits<T>::max();
+                } else if (sum <= t_min) {
+                  out[col] = std::numeric_limits<T>::lowest();
+                } else {
+                  out[col] = static_cast<T>(sum);
+                }
               } else {
                 out[col] = static_cast<T>(sum);
               }
@@ -364,8 +379,8 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
     int64_t strideo = fast_shape[2];
     T* out = output.MutableData<T>();
 
-    if constexpr (std::is_integral_v<T>) {
-      // Accumulate the middle dimension in double to avoid signed overflow UB.
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
+      // Accumulate the middle dimension in double for better precision.
       concurrency::ThreadPool::TryParallelFor(
           tp, onnxruntime::narrow<ptrdiff_t>(fast_shape[0]),
           ParallelReduceFastCost(fast_shape[1], fast_shape[2], sizeof(T), 6),
@@ -376,12 +391,16 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
                 for (int64_t row = 0; row < fast_shape[1]; ++row) {
                   sum += static_cast<double>(data[stridei * d + row * N + col]);
                 }
-                constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-                constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
-                if (sum >= t_max) {
-                  out[strideo * d + col] = std::numeric_limits<T>::max();
-                } else if (sum <= t_min) {
-                  out[strideo * d + col] = std::numeric_limits<T>::lowest();
+                if constexpr (std::is_integral_v<T>) {
+                  constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+                  constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
+                  if (sum >= t_max) {
+                    out[strideo * d + col] = std::numeric_limits<T>::max();
+                  } else if (sum <= t_min) {
+                    out[strideo * d + col] = std::numeric_limits<T>::lowest();
+                  } else {
+                    out[strideo * d + col] = static_cast<T>(sum);
+                  }
                 } else {
                   out[strideo * d + col] = static_cast<T>(sum);
                 }
@@ -406,7 +425,7 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
 
   static void FastReduceRKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
                             Tensor& output, concurrency::ThreadPool* tp) {
-    if constexpr (std::is_integral_v<T>) {
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
       // Use double accumulation across outer-dimension partial sums.
       const T* data = input.Data<T>();
       T* out = output.MutableData<T>();
@@ -426,12 +445,16 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
                   sum += static_cast<double>(p[j]);
                 }
               }
-              constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-              constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
-              if (sum >= t_max) {
-                out[d] = std::numeric_limits<T>::max();
-              } else if (sum <= t_min) {
-                out[d] = std::numeric_limits<T>::lowest();
+              if constexpr (std::is_integral_v<T>) {
+                constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+                constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
+                if (sum >= t_max) {
+                  out[d] = std::numeric_limits<T>::max();
+                } else if (sum <= t_min) {
+                  out[d] = std::numeric_limits<T>::lowest();
+                } else {
+                  out[d] = static_cast<T>(sum);
+                }
               } else {
                 out[d] = static_cast<T>(sum);
               }
@@ -519,7 +542,7 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
  public:
   inline ReduceAggregatorMean(int64_t N, const T&) : ReduceAggregatorSum<T>(N, 0) {}
   static T aggall(const T* from_data, int64_t size) {
-    if constexpr (std::is_integral_v<T>) {
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
       // Accumulate in double, divide, then saturate back to T.
       double sum = 0.0;
       if constexpr (kReduceUseKahan<T>) {
@@ -536,10 +559,12 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
         }
       }
       double result = sum / static_cast<double>(size);
-      constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-      constexpr double t_min = static_cast<double>(std::numeric_limits<T>::min());
-      if (result >= t_max) return std::numeric_limits<T>::max();
-      if (result <= t_min) return std::numeric_limits<T>::min();
+      if constexpr (std::is_integral_v<T>) {
+        constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+        constexpr double t_min = static_cast<double>(std::numeric_limits<T>::min());
+        if (result >= t_max) return std::numeric_limits<T>::max();
+        if (result <= t_min) return std::numeric_limits<T>::min();
+      }
       return static_cast<T>(result);
     } else {
       return Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>>(
@@ -551,12 +576,14 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
     return aggall(from_data, this->N_);
   }
   inline T get_value() {
-    if constexpr (std::is_integral_v<T>) {
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
       double result = this->double_accumulator_ / static_cast<double>(this->N_);
-      constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-      constexpr double t_min = static_cast<double>(std::numeric_limits<T>::min());
-      if (result >= t_max) return std::numeric_limits<T>::max();
-      if (result <= t_min) return std::numeric_limits<T>::min();
+      if constexpr (std::is_integral_v<T>) {
+        constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+        constexpr double t_min = static_cast<double>(std::numeric_limits<T>::min());
+        if (result >= t_max) return std::numeric_limits<T>::max();
+        if (result <= t_min) return std::numeric_limits<T>::min();
+      }
       return static_cast<T>(result);
     } else {
       return this->accumulator_ / static_cast<T>(this->N_);
@@ -568,8 +595,8 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
 
   static void FastReduceKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
                            Tensor& output, concurrency::ThreadPool* tp) {
-    if constexpr (std::is_integral_v<T>) {
-      // For integers: compute sum in double and divide before saturating to T.
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
+      // Compute sum in double and divide before casting back to T.
       const T* data = input.Data<T>();
       T* out = output.MutableData<T>();
       int64_t stridei = fast_shape[1];
@@ -584,14 +611,18 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
                 sum += static_cast<double>(data[d * stridei + i]);
               }
               double result = sum / divisor;
-              constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-              constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
-              if (result >= t_max)
-                out[d] = std::numeric_limits<T>::max();
-              else if (result <= t_min)
-                out[d] = std::numeric_limits<T>::lowest();
-              else
+              if constexpr (std::is_integral_v<T>) {
+                constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+                constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
+                if (result >= t_max)
+                  out[d] = std::numeric_limits<T>::max();
+                else if (result <= t_min)
+                  out[d] = std::numeric_limits<T>::lowest();
+                else
+                  out[d] = static_cast<T>(result);
+              } else {
                 out[d] = static_cast<T>(result);
+              }
             }
           });
     } else {
@@ -606,8 +637,8 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
 
   static void FastReduceRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
                            Tensor& output, concurrency::ThreadPool* tp) {
-    if constexpr (std::is_integral_v<T>) {
-      // For integers: compute sum in double and divide before saturating to T.
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
+      // Compute sum in double and divide before casting back to T.
       int64_t N = fast_shape[1];
       const T* data = input.Data<T>();
       T* out = output.MutableData<T>();
@@ -623,14 +654,18 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
                 sum += static_cast<double>(data[row * N + col]);
               }
               double result = sum / divisor;
-              constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-              constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
-              if (result >= t_max)
-                out[col] = std::numeric_limits<T>::max();
-              else if (result <= t_min)
-                out[col] = std::numeric_limits<T>::lowest();
-              else
+              if constexpr (std::is_integral_v<T>) {
+                constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+                constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
+                if (result >= t_max)
+                  out[col] = std::numeric_limits<T>::max();
+                else if (result <= t_min)
+                  out[col] = std::numeric_limits<T>::lowest();
+                else
+                  out[col] = static_cast<T>(result);
+              } else {
                 out[col] = static_cast<T>(result);
+              }
             }
           });
     } else {
@@ -645,8 +680,8 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
 
   static void FastReduceKRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
                             Tensor& output, concurrency::ThreadPool* tp) {
-    if constexpr (std::is_integral_v<T>) {
-      // For integers: compute sum in double and divide before saturating to T.
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
+      // Compute sum in double and divide before casting back to T.
       int64_t N = fast_shape[2];
       const T* data = input.Data<T>();
       int64_t stridei = fast_shape[1] * fast_shape[2];
@@ -664,14 +699,18 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
                   sum += static_cast<double>(data[stridei * d + row * N + col]);
                 }
                 double result = sum / divisor;
-                constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-                constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
-                if (result >= t_max)
-                  out[strideo * d + col] = std::numeric_limits<T>::max();
-                else if (result <= t_min)
-                  out[strideo * d + col] = std::numeric_limits<T>::lowest();
-                else
+                if constexpr (std::is_integral_v<T>) {
+                  constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+                  constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
+                  if (result >= t_max)
+                    out[strideo * d + col] = std::numeric_limits<T>::max();
+                  else if (result <= t_min)
+                    out[strideo * d + col] = std::numeric_limits<T>::lowest();
+                  else
+                    out[strideo * d + col] = static_cast<T>(result);
+                } else {
                   out[strideo * d + col] = static_cast<T>(result);
+                }
               }
             }
           });
@@ -694,8 +733,8 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
 
   static void FastReduceRKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
                             Tensor& output, concurrency::ThreadPool* tp) {
-    if constexpr (std::is_integral_v<T>) {
-      // For integers: compute sum in double and divide before saturating to T.
+    if constexpr (kReduceUseDoubleAccumulator<T>) {
+      // Compute sum in double and divide before casting back to T.
       const T* data = input.Data<T>();
       T* out = output.MutableData<T>();
       int64_t d0 = fast_shape[0];
@@ -715,14 +754,18 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
                 }
               }
               double result = sum / divisor;
-              constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
-              constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
-              if (result >= t_max)
-                out[d] = std::numeric_limits<T>::max();
-              else if (result <= t_min)
-                out[d] = std::numeric_limits<T>::lowest();
-              else
+              if constexpr (std::is_integral_v<T>) {
+                constexpr double t_max = static_cast<double>(std::numeric_limits<T>::max());
+                constexpr double t_min = static_cast<double>(std::numeric_limits<T>::lowest());
+                if (result >= t_max)
+                  out[d] = std::numeric_limits<T>::max();
+                else if (result <= t_min)
+                  out[d] = std::numeric_limits<T>::lowest();
+                else
+                  out[d] = static_cast<T>(result);
+              } else {
                 out[d] = static_cast<T>(result);
+              }
             }
           });
     } else {
